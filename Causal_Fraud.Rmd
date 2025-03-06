@@ -1,0 +1,150 @@
+---
+title: "Causal Inference in Fraud Detection"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## 1. Data Preprocessing
+
+The dataset I will be working with has 1 million observations and 32 variables, both numeric and categorical. Out of them, 'fraud_bool' is the response variable holding binary values.
+
+```{r}
+library(dplyr)
+library(fastDummies)
+```
+```{r}
+data = read.csv('Nigerian_Fraud_Dataset_Base.csv')
+str(data)
+```
+This dataset is highly imbalanced with nearly 99% data as genuine transactions.
+
+```{r}
+data$fraud_bool %>% as.factor() %>% summary
+```
+Because variable 'device_fraud_count' has only '0' value, this variable will be omitted.
+
+```{r}
+data <- data %>% select(-device_fraud_count)
+```
+
+Since Bayesian Network learning requires numeric variables, 5 categorical features of the dataset will be converted using one hot coding.
+
+This process results in 26 new dummies, increasing the feature count to 52 (excluding 5 originally categorical features).
+
+```{r}
+cat_vars_ls <- c("payment_type", "employment_status", "housing_status",
+                 "source", "device_os")
+data <- dummy_cols(data, select_columns = cat_vars_ls, 
+                   remove_selected_columns = TRUE)
+```
+
+Since numeric variables of the dataset have different data ranges, I will apply Min-Max standardisation to scale them within range [0:1].
+
+To make it simple, all 52 variables will be standardised since they all hold numeric values. The binary features still remain intact.
+
+```{r}
+df_num <- data %>% 
+  mutate(across(everything(), ~ (.-min(.)) / (max(.) - min(.))))
+str(df_num)
+```
+## 2. Modelling
+
+### a. Learning a Bayesian Network structure
+
+I will use the PC-algorithm to generate a completed partially DAG with all 51 predictors.
+
+The learning has taken for a while to produce a DAG of 276 edges within which 15 edges were left undirected.
+
+```{r}
+library(bnlearn)
+library(pcalg)
+
+set.seed(789)
+cpdag <- pc(suffStat = list(C = cor(df_num[ ,-1]), n = nrow(df_num)),
+            indepTest = gaussCItest, labels = colnames(df_num[ ,-1]),
+            alpha= .01, u2pd = "rand")
+cpdag
+```
+```{r}
+# Check if cpdag1 is a valid CPDAG
+cpdag_amat <- as(cpdag, "amat")
+isValidGraph(cpdag_amat, type = "cpdag", verbose = TRUE)
+```
+The code below is for visualisation's convenience.The above DAG is then exported to a pdf file.
+
+```{r}
+# Export cpdag to a bn object for visualisation
+cpdag_bn <- as.bn(cpdag, check.cycles = TRUE)
+
+# Function to split variable names into 2 lines
+split_var_names <- function(names) {
+  sapply(names, function(name) {
+    n <- nchar(name)
+    if (n > 1) {
+      mid <- ceiling(n / 2)
+      paste(substr(name, 1, mid), substr(name, mid + 1, n), sep = "\n")
+    } else {
+      name
+    }
+  })
+}
+
+# Apply the splitting function to the node names
+original_names <- nodes(cpdag_bn)
+new_names <- split_var_names(original_names)
+nodes(cpdag_bn) <- new_names
+
+# Plot the CPDAG with adjusted variable names
+pdf("cpdag_plot.pdf", width = 11, height = 8.5)
+
+graphviz.plot(cpdag_bn, layout = "dot", fontsize = 15, main = 'Completed Partially DAG by PC-algorithm, alpha = 0.01')
+
+dev.off()
+```
+
+```{r}
+graphviz.plot(cpdag_bn, layout = "dot", fontsize = 15, main = 'Completed Partially DAG by PC-algorithm, alpha = 0.01')
+```
+### b. Fraud Detection Model
+The PC-simple algorithm is used to find the immediate nodes surrounding the class variable 'fraud_bool'. This method is widely accepted as a feature reduction tool for classification models.
+
+```{r}
+# # Find the parent and children set of class variable
+feature_select <- pcSelect(df_num[,1], df_num[,-1], alpha = 0.01)
+
+df_feature_select <- data.frame(
+  Variable = names(feature_select$G),  # Extract variable names
+  Selected = feature_select$G,         # Extract TRUE/FALSE values
+  zMin = feature_select$zMin,           # Extract zMin values
+  row.names = NULL
+)
+head(df_feature_select)
+```
+From the PC-simple, 17 variables are identified as the most important predictors to incorporate into the classifier.
+
+```{r}
+selected_vars_ls <- df_feature_select$Variable[df_feature_select$Selected]
+selected_vars_ls
+```
+A Naive Bayes model is trained using the above 17 input variables, optimised via 10-fold cross validation and SMOTE sampling to address imbalanced class.
+
+```{r}
+library(caret)
+library(naivebayes)
+
+df_num$fraud_bool <- as.factor(df_num$fraud_bool)
+
+train_ctr <- trainControl(method = "cv", number = 10, sampling = "smote")
+nb <- train(fraud_bool ~ ., data = df_num[, c(selected_vars_ls, "fraud_bool")], 
+                   method = "naive_bayes", trControl = train_ctr)
+
+print(nb)
+```
+The model produces 2 results corresponding to whether to use of kernel density estimation (KDE). The outperforming accuracy in the case of KDE suggests that the input variables do not abide by normal distribution. In addition, the improved Kappa shows that the KDE model is better to deal with this imbalanced dataset.
+
